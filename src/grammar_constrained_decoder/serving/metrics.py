@@ -30,6 +30,8 @@ _REASONS = frozenset(
         "pattern_length",
         "repeat_bound",
         "depth",
+        "schema_depth",
+        "ref_depth",
         "schema_size",
         "properties",
         "enum_size",
@@ -37,11 +39,13 @@ _REASONS = frozenset(
         "number_digits",
         "nfa_states",
         "dfa_states",
+        "subset_size",
         "index_entries",
         "timeout",
         "dead_end",
         "empty_language",
         "schema_too_large",
+        "internal",
     }
 )
 

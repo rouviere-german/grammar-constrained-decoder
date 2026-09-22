@@ -4,7 +4,8 @@
 ``value``: compact separators, object members in the schema's declaration order, canonical string
 escapes, integers as plain digits and numbers in fixed-point form (never exponent notation, never
 ``-0``). Enum values are written as the schema's own literal for the equal enum member, so ``1``
-and ``1.0`` in an enum of ``[1.0]`` both serialize as ``1.0``.
+and ``1.0`` in an enum of ``[1.0]`` both serialize as ``1.0``; enum literals follow the same number
+rules (``ir.literal_text``).
 
 ``matches(ir, value)`` decides validity against the IR without ``jsonschema`` and without Python
 ``re``: patterns are compiled by the in-repo parser into DFAs. It is used to pick the ``anyOf``
@@ -15,11 +16,13 @@ from __future__ import annotations
 
 import json
 import math
+import threading
+from collections import OrderedDict
 from decimal import Decimal
-from functools import lru_cache
 from typing import Any
 
 from grammar_constrained_decoder.automata.dfa import DFA, compile_regex
+from grammar_constrained_decoder.automata.limits import DEFAULT_LIMITS, CompileBudget, CompileLimits
 from grammar_constrained_decoder.automata.pattern import compile_pattern
 from grammar_constrained_decoder.core.canonical import canonical_json
 from grammar_constrained_decoder.schema.ir import (
@@ -36,24 +39,66 @@ from grammar_constrained_decoder.schema.ir import (
     Ref,
     SchemaIR,
     String,
+    fixed_point,
     json_type_of,
 )
 
-__all__ = ["CanonicalError", "canonical_dumps", "decimal_of", "matches", "number_text"]
+__all__ = [
+    "CanonicalError",
+    "canonical_dumps",
+    "decimal_of",
+    "matches",
+    "number_text",
+    "pattern_dfa",
+    "pattern_search",
+]
 
 
 class CanonicalError(ValueError):
     """The value is not an instance of the schema, so it has no canonical form."""
 
 
-@lru_cache(maxsize=512)
-def _pattern_dfa(pattern: str) -> DFA:
-    return compile_regex(compile_pattern(pattern))
+_PATTERN_CACHE_SIZE = 512
+_pattern_cache: OrderedDict[tuple[str, CompileLimits], DFA] = OrderedDict()
+_pattern_lock = threading.Lock()
 
 
-def pattern_search(pattern: str, text: str) -> bool:
-    """ECMA-style ``pattern`` search over ``text`` using the in-repo parser and a DFA."""
-    return _pattern_dfa(pattern).accepts(text.encode("utf-8"))
+def pattern_dfa(
+    pattern: str, limits: CompileLimits = DEFAULT_LIMITS, budget: CompileBudget | None = None
+) -> DFA:
+    """DFA for an ECMA ``pattern`` (search semantics over raw UTF-8), compiled under ``limits``.
+
+    Compilation charges ``budget`` (a fresh one for ``limits`` when omitted), so a hostile
+    pattern costs at most the caller's timeout and state caps and raises :class:`CompileError`.
+    Successes are cached per (pattern, limits); failures are not (callers cache rejections).
+    """
+    key = (pattern, limits)
+    with _pattern_lock:
+        cached = _pattern_cache.get(key)
+        if cached is not None:
+            _pattern_cache.move_to_end(key)
+            return cached
+    dfa = compile_regex(
+        compile_pattern(pattern, limits=limits),
+        budget if budget is not None else CompileBudget(limits),
+    )
+    with _pattern_lock:
+        _pattern_cache[key] = dfa
+        _pattern_cache.move_to_end(key)
+        while len(_pattern_cache) > _PATTERN_CACHE_SIZE:
+            _pattern_cache.popitem(last=False)
+    return dfa
+
+
+def pattern_search(pattern: str, text: str, limits: CompileLimits = DEFAULT_LIMITS) -> bool:
+    """ECMA-style ``pattern`` search over ``text`` using the in-repo parser and a DFA.
+
+    Text with a lone surrogate has no UTF-8 encoding and never matches (the compiled classes
+    exclude surrogate code points).
+    """
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in text):
+        return False
+    return pattern_dfa(pattern, limits).accepts(text.encode("utf-8"))
 
 
 def decimal_of(value: int | float) -> Decimal:
@@ -76,9 +121,7 @@ def number_text(value: Any, *, integer: bool) -> str:
         return str(value)
     if isinstance(value, int):
         return str(value)
-    if value == 0:
-        return "0.0"
-    return format(Decimal(repr(value)), "f")
+    return fixed_point(value)
 
 
 def _is_number(value: Any) -> bool:

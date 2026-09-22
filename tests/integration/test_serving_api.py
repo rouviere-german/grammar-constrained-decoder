@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import re
@@ -52,6 +53,14 @@ def settings(tmp_path: Path, **overrides: Any) -> Settings:
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
+
+
+def post_ascii(client: TestClient, url: str, body: dict[str, Any], headers: dict[str, str]) -> Any:
+    """POST ``body`` as ASCII-escaped JSON, the way a client sends lone surrogates (``\\ud800``);
+    httpx's own ``json=`` encoder writes raw UTF-8 and cannot encode them."""
+    return client.post(
+        url, content=json.dumps(body), headers={**headers, "Content-Type": "application/json"}
+    )
 
 
 def bearer(subject: str = "alice", scopes: tuple[str, ...] = (SCOPE_GENERATE,)) -> dict[str, str]:
@@ -268,7 +277,12 @@ def test_schema_registration_needs_admin_and_is_audited(
     result = verify_file(audit_path)
     assert result.ok
     entries = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
-    assert [entry["action"] for entry in entries] == ["schema.register", "schema.reject"]
+    assert [entry["action"] for entry in entries] == [
+        "schema.register", "schema.reject", "schema.reject", "schema.reject",
+    ]  # fmt: skip
+    assert [entry["data"].get("reason") for entry in entries[1:]] == [
+        "schema_conflict", "schema_conflict", "schema_rejected",
+    ]  # fmt: skip
     assert entries[0]["actor"] == "root"
     assert "properties" not in json.dumps(entries)  # hashes and ids only, never schema bodies
 
@@ -351,22 +365,200 @@ def test_metrics_expose_decoder_series(client: TestClient) -> None:
         assert name in text, name
 
 
+RE_GUARD_CASES: list[tuple[bool, dict[str, Any], int]] = [
+    (True, {"type": "string", "pattern": "^(evil|x+)+$", "maxLength": 8}, 200),
+    (False, {"type": "string", "pattern": "^(evil|x+)+$", "maxLength": 8}, 200),
+    (False, {"type": "object", "patternProperties": {"^(evil|x+)+$": {"type": "integer"}}}, 400),
+    (True, {"type": "object", "patternProperties": {"^(evil|x+)+$": {"type": "integer"}}}, 400),
+    (False, {"type": "object", "propertyNames": {"pattern": "^(evil|x+)+$"}}, 400),
+    (False, {"type": "string", "format": "^(evil|x+)+$"}, 400),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("constrained", "schema", "status"), RE_GUARD_CASES)
 def test_python_re_never_sees_a_client_pattern(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    constrained: bool,
+    schema: dict[str, Any],
+    status: int,
 ) -> None:
-    schema = {"type": "string", "pattern": "^(a|aa)+X$", "maxLength": 8}
     seen: list[str] = []
     real_compile = vars(re)["_compile"]  # what re.compile, re.search and re.match all call
 
     def guarded(pattern: Any, flags: Any) -> Any:
-        if isinstance(pattern, str) and "(a|aa)" in pattern:
+        if isinstance(pattern, str) and "(evil|x+)" in pattern:
             seen.append(pattern)
         return real_compile(pattern, flags)
 
     monkeypatch.setattr(re, "_compile", guarded)
-    response = client.post(
-        "/v1/generate", json={"schema": schema, "max_tokens": 20}, headers=bearer()
-    )
-    assert response.status_code == 200
-    assert response.json()["valid"] is True
+    body = {"prompt": '{"xx":', "schema": schema, "constrained": constrained, "max_tokens": 20}
+    response = client.post("/v1/generate", json=body, headers=bearer())
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json()["valid"] is True or not constrained
+    else:
+        assert response.json()["error"]["code"] == "schema_rejected"
     assert seen == []
+
+
+def _ref_chain(links: int) -> dict[str, Any]:
+    definitions: dict[str, Any] = {f"d{i}": {"$ref": f"#/$defs/d{i + 1}"} for i in range(links)}
+    definitions[f"d{links}"] = {"type": "null"}
+    return {"$defs": definitions, "$ref": "#/$defs/d0"}
+
+
+def _nested_any_of(levels: int) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "null"}
+    for _ in range(levels):
+        schema = {"anyOf": [schema]}
+    return schema
+
+
+def hostile_inline_schemas(base: str, tmp_path: Path) -> list[tuple[str, Any, int, str]]:
+    local = tmp_path / "integer.json"
+    local.write_text(json.dumps({"type": "integer"}), encoding="utf-8")
+    return [
+        ("http ref", {"$ref": f"{base}/evil.json"}, 400, "schema_rejected"),
+        ("file ref", {"$ref": local.as_uri()}, 400, "schema_rejected"),
+        ("format", {"type": "string", "format": "email"}, 400, "schema_rejected"),
+        ("lookahead", {"type": "string", "pattern": "(?=a)a"}, 400, "schema_rejected"),
+        ("surrogate enum", {"enum": ["\ud800"]}, 400, "schema_rejected"),
+        ("surrogate key", {"type": "object", "properties": {"\ud800": {"type": "null"}}},
+         400, "schema_rejected"),
+        ("surrogate pattern", {"type": "string", "pattern": "a\udfff"}, 400, "schema_rejected"),
+        ("ref chain", _ref_chain(600), 400, "schema_rejected"),
+        ("nested anyOf", _nested_any_of(400), 400, "schema_rejected"),
+        ("containerless cycle", {"$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"$ref": "#/$defs/a"}},
+                                 "$ref": "#/$defs/a"}, 400, "schema_rejected"),
+        ("oversize", {"enum": ["v" * 40_000]}, 413, "schema_too_large"),
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize("constrained", [True, False])
+def test_inline_schemas_are_vetted_whether_or_not_decoding_is_constrained(
+    client: TestClient,
+    schema_server: tuple[str, list[str]],
+    tmp_path: Path,
+    constrained: bool,
+) -> None:
+    base, hits = schema_server
+    for name, schema, status, code in hostile_inline_schemas(base, tmp_path):
+        body = {"prompt": '{"quantity":', "schema": schema, "constrained": constrained,
+                "max_tokens": 1}  # fmt: skip
+        response = post_ascii(client, "/v1/generate", body, bearer())
+        assert response.status_code == status, (name, response.status_code, response.text)
+        assert response.json()["error"]["code"] == code, name
+    assert hits == []  # no schema host was ever contacted
+    text = client.get("/metrics", headers={"X-API-Key": API_KEY}).text
+    reasons = ("unsupported", "invalid", "pattern", "ref_depth", "schema_depth", "empty_language",
+               "schema_too_large")  # fmt: skip
+    for reason in reasons:
+        assert f'app_compile_rejections_total{{reason="{reason}"}}' in text, reason
+
+
+def test_non_finite_numbers_in_schemas_are_rejected(client: TestClient) -> None:
+    for constrained in ("true", "false"):
+        raw = (
+            '{"prompt": "x", "max_tokens": 1, "constrained": ' + constrained + ", "
+            '"schema": {"type": "null", "default": NaN}}'
+        )
+        response = client.post(
+            "/v1/generate",
+            content=raw,
+            headers={**bearer(), "Content-Type": "application/json"},
+        )
+        assert response.status_code == 400, response.text
+        assert response.json()["error"]["code"] == "schema_rejected"
+
+
+def test_validation_runs_off_the_event_loop(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = app.state.service
+    real_finish = service.finish
+    where: list[str] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            where.append("worker")
+        else:
+            where.append("event loop")
+        return real_finish(*args, **kwargs)
+
+    monkeypatch.setattr(service, "finish", spy)
+    body = {"prompt": "Q: weather\nweather:\n", "schema": WEATHER, "max_tokens": 60}
+    with client.stream(
+        "POST", "/v1/generate", json={**body, "stream": True}, headers=bearer()
+    ) as response:
+        assert response.status_code == 200
+        assert any(line.startswith("event: done") for line in response.iter_lines())
+    assert client.post("/v1/generate", json=body, headers=bearer()).status_code == 200
+    assert where == ["worker", "worker"]
+
+
+def test_rejected_schemas_are_remembered(
+    trained: Trained, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = build_app(settings(tmp_path, compile_timeout_seconds=0.5), model=trained.model)
+    schema = {"type": "string", "pattern": "^(((a|b){0,60}){0,60}){0,60}$"}
+    with TestClient(app) as client:
+        compiler = app.state.service.compiler
+        calls: list[int] = []
+        real_compile = compiler.compile
+
+        def counting(value: Any) -> Any:
+            calls.append(1)
+            return real_compile(value)
+
+        monkeypatch.setattr(compiler, "compile", counting)
+        messages = set()
+        for constrained in (False, True, False):
+            body = {"prompt": "x", "schema": schema, "constrained": constrained, "max_tokens": 4}
+            response = client.post("/v1/generate", json=body, headers=bearer())
+            assert response.status_code == 400
+            assert response.json()["error"]["code"] == "schema_rejected"
+            messages.add(response.json()["error"]["message"])
+        assert calls == [1]  # compiled once; replays are answered from the rejection cache
+        assert len(messages) == 1
+
+
+def test_every_registration_failure_is_audited(
+    app: FastAPI, client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admin = bearer("root", (SCOPE_ADMIN,))
+    cases = [
+        ("surrogate", {"enum": ["\ud800"]}, 400),
+        ("chain", _ref_chain(600), 400),
+        ("too-big", {"enum": ["v" * 40_000]}, 413),
+    ]
+    for schema_id, schema, status in cases:
+        response = post_ascii(
+            client, "/v1/schemas", {"schema_id": schema_id, "schema": schema}, admin
+        )
+        assert response.status_code == status, response.text
+
+    def explode(value: Any) -> Any:
+        raise RecursionError("simulated")
+
+    monkeypatch.setattr(app.state.service.compiler, "compile", explode)
+    crashed = client.post(
+        "/v1/schemas", json={"schema_id": "boom", "schema": {"type": "null"}}, headers=admin
+    )
+    assert crashed.status_code == 400
+    assert crashed.json()["error"]["code"] == "schema_rejected"
+    assert "simulated" not in crashed.text
+
+    audit_path = tmp_path / "data" / "schema-registry" / "registry_audit.jsonl"
+    assert verify_file(audit_path).ok
+    entries = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert [entry["action"] for entry in entries] == ["schema.reject"] * 4
+    assert [entry["data"]["schema_id"] for entry in entries] == [
+        "surrogate", "chain", "too-big", "boom",
+    ]  # fmt: skip
+    assert [entry["data"]["reason"] for entry in entries] == [
+        "schema_rejected", "schema_rejected", "schema_too_large", "schema_rejected",
+    ]  # fmt: skip
+    assert all(len(entry["data"]["sha256"]) == 64 for entry in entries)

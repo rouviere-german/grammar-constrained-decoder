@@ -8,7 +8,8 @@ handling). Route protection:
 - ``/metrics`` needs an operator API key (template behavior); ``/healthz`` and ``/readyz`` are open.
 
 Generations also pass a non-blocking concurrency cap (global and per client). CPU-bound work
-(compilation, decoding steps) runs in worker threads so the event loop keeps serving.
+(compilation, decoding steps, output validation) runs in worker threads so the event loop keeps
+serving, including for streamed responses.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from grammar_constrained_decoder.core.app import create_app
-from grammar_constrained_decoder.core.canonical import canonical_json, sha256_hex
 from grammar_constrained_decoder.core.config import Settings, get_settings
 from grammar_constrained_decoder.core.errors import AppError
 from grammar_constrained_decoder.core.logging import get_logger
@@ -52,6 +52,7 @@ from grammar_constrained_decoder.serving.service import (
     GenerationService,
     Prepared,
     ServiceError,
+    schema_digest,
 )
 from grammar_constrained_decoder.training.corpus import load_bundled_schemas
 from grammar_constrained_decoder.training.pipeline import (
@@ -152,13 +153,16 @@ async def _stream_events(
             tokens += 1
             text_parts.append(event.text)
             yield {"event": "token", "data": json.dumps({"index": event.index, "text": event.text})}
-        summary = service.finish(
-            prepared,
-            text="".join(text_parts),
-            tokens=tokens,
-            stop_reason=stop_reason,
-            seconds=time.perf_counter() - started,
-            mask_seconds=masks,
+        summary = await run_in_threadpool(
+            partial(
+                service.finish,
+                prepared,
+                text="".join(text_parts),
+                tokens=tokens,
+                stop_reason=stop_reason,
+                seconds=time.perf_counter() - started,
+                mask_seconds=masks,
+            )
         )
         summary.pop("text")
         yield {"event": "done", "data": json.dumps(summary)}
@@ -253,17 +257,22 @@ def _install_schema_routes(app: FastAPI, schemas: SchemaRegistry) -> None:
     async def register_schema(
         body: RegisterSchemaRequest, principal: AdminPrincipal, request: Request
     ) -> dict[str, Any]:
-        """Compile and register a schema (admin scope). Rejections are audited too."""
+        """Compile and register a schema (admin scope). Every rejection, conflicts included, is
+        appended to the audit log with the schema digest and a reason code."""
         active = _service(request)
-        digest = sha256_hex(canonical_json(body.json_schema))
+        digest = schema_digest(body.json_schema)
+
+        def reject(code: str) -> None:
+            schemas.record_rejection(
+                actor=principal.subject, schema_id=body.schema_id, digest=digest, reason=code
+            )
+
         try:
             compiled = await run_in_threadpool(
                 partial(active.compile_schema, body.json_schema, client_supplied=True)
             )
         except ServiceError as exc:
-            schemas.record_rejection(
-                actor=principal.subject, schema_id=body.schema_id, digest=digest, reason=exc.code
-            )
+            reject(exc.code)
             raise _app_error(exc) from None
         stats = {
             "dfa_states": compiled.stats.dfa_states,
@@ -274,6 +283,7 @@ def _install_schema_routes(app: FastAPI, schemas: SchemaRegistry) -> None:
                 body.schema_id, body.json_schema, actor=principal.subject, stats=stats
             )
         except SchemaConflictError as exc:
+            reject("schema_conflict")
             raise AppError(409, "schema_conflict", "That schema id is taken.") from exc
         return {"schema_id": record.schema_id, "sha256": record.sha256, **stats}
 

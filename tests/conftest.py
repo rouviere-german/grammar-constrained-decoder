@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import http.server
+import json
 import logging
 import os
 import socket
+import threading
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import numpy.typing as npt
@@ -79,6 +82,39 @@ def restore_logging() -> Iterator[None]:
 @pytest.fixture
 def repo_root() -> Path:
     return REPO_ROOT
+
+
+class _RecordingHandler(http.server.BaseHTTPRequestHandler):
+    """Serves ``{"type": "integer"}`` for any GET and records the path (a stand-in for a remote
+    schema host that a hostile ``$ref`` could point at)."""
+
+    hits: ClassVar[list[str]] = []
+
+    def do_GET(self) -> None:
+        type(self).hits.append(self.path)
+        body = json.dumps({"type": "integer"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        del format, args
+
+
+@pytest.fixture
+def schema_server() -> Iterator[tuple[str, list[str]]]:
+    """A loopback HTTP server; yields its base URL and the list of paths requested from it."""
+    _RecordingHandler.hits = []
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RecordingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", _RecordingHandler.hits
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def make_vocab(
