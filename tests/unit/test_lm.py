@@ -131,7 +131,8 @@ def naive_kn_prob(
         y = n[0] / (n[0] + 2 * n[1])
         d = (1 - 2 * y * n[1] / n[0], 2 - 3 * y * n[2] / n[1] if n[1] else 1.0,
              3 - 4 * y * n[3] / n[2] if n[2] else 1.5)  # fmt: skip
-        return (min(max(d[0], 0), 1), min(max(d[1], 0), 2), min(max(d[2], 0), 3))
+        floor = 0.1  # the model floors every discount so no context can give a zero probability
+        return (min(max(d[0], floor), 1), min(max(d[1], floor), 2), min(max(d[2], floor), 3))
 
     def discount(value: int, d: tuple[float, float, float]) -> float:
         return d[0] if value == 1 else d[1] if value == 2 else d[2]
@@ -177,6 +178,25 @@ def test_distributions_are_normalized_and_positive(trained: Trained, context: li
     assert probs.shape == (1024,)
     assert float(probs.sum()) == pytest.approx(1.0, abs=1e-9)
     assert float(probs.min()) > 0
+
+
+def test_sparse_count_statistics_never_zero_a_probability() -> None:
+    """Count-of-counts where Chen and Goodman's estimate of D3+ is negative (many n-grams seen
+    four times, few seen three times): with the estimate clipped to zero, a context whose
+    continuations were all seen 3+ times would give every other token probability 0. Discounts
+    are floored instead, so every distribution stays strictly positive."""
+    sequences = [list(range(start, start + 6)) for start in range(1, 37, 6)]  # disjoint tokens
+    docs = [
+        *[sequences[0]] * 4, *[sequences[1]] * 4, *[sequences[2]] * 4,
+        *[sequences[3]] * 3, *[sequences[4]] * 2, sequences[5],
+    ]  # fmt: skip
+    lm = KneserNeyLM.fit(docs, vocab_size=40, order=5, bos_id=0)
+    assert float(lm.discounts[1:].min()) > 0
+    for doc in docs:
+        for cut in range(len(doc) + 1):
+            probs = lm.probs(doc[:cut])
+            assert float(probs.sum()) == pytest.approx(1.0, abs=1e-9)
+            assert float(probs.min()) > 0, doc[:cut]
 
 
 def test_model_beats_a_unigram_baseline_on_held_out_text(trained: Trained) -> None:

@@ -38,6 +38,12 @@ __all__ = ["KneserNeyLM", "LMFormatError"]
 FloatArray = npt.NDArray[np.float64]
 IntArray = npt.NDArray[np.int64]
 _MAX_KEY_BITS = 62
+# Chen and Goodman's discount estimates can be zero or negative on sparse count statistics (for
+# example many n-grams seen four times and few seen three times). A zero discount makes the
+# back-off weight of a context zero whenever all its continuations share that count bucket, which
+# gives every unseen token probability 0. Flooring the discounts keeps every distribution
+# strictly positive; the shipped model's estimates are all above the floor, so it is unaffected.
+_MIN_DISCOUNT = 0.1
 
 
 class LMFormatError(ValueError):
@@ -53,9 +59,9 @@ def _discounts(counts: npt.NDArray[np.int64]) -> tuple[float, float, float]:
     d2 = 2 - 3 * y * n[2] / n[1] if n[1] else 1.0
     d3 = 3 - 4 * y * n[3] / n[2] if n[2] else 1.5
     return (
-        float(min(max(d1, 0.0), 1.0)),
-        float(min(max(d2, 0.0), 2.0)),
-        float(min(max(d3, 0.0), 3.0)),
+        float(min(max(d1, _MIN_DISCOUNT), 1.0)),
+        float(min(max(d2, _MIN_DISCOUNT), 2.0)),
+        float(min(max(d3, _MIN_DISCOUNT), 3.0)),
     )
 
 
