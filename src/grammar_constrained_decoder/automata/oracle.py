@@ -16,7 +16,9 @@ distinct derivatives. The oracle uses that to answer three questions without tou
   walk is a bisimulation, i.e. a proof that the DFA accepts exactly L(root).
   :meth:`DerivativeOracle.check_token_index` then recomputes, for every state reachable at token
   boundaries, the set of tokens whose bytes leave the derivative non-empty and compares it with
-  the precomputed token index, including the successor state of every allowed token.
+  the precomputed token index, including the successor state of every allowed token. The set of
+  token-reachable states is computed by the oracle itself (a search over the tokens it allows)
+  and compared with the index's own list, so the index cannot hide a state from the check.
 
 The oracle computes its own byte partition from the masks in the regex (all masks of every
 derivative are unions or intersections of those, so the partition is valid for all of them).
@@ -85,6 +87,7 @@ class EquivalenceReport:
     mismatches: list[str] = field(default_factory=list)
     representative: dict[int, Regex] = field(default_factory=dict)
     pair_set: set[tuple[int, int]] = field(default_factory=set)
+    dfa: DFA | None = field(default=None, repr=False, compare=False)
 
     @property
     def ok(self) -> bool:
@@ -121,6 +124,26 @@ def _signature_partition(masks: set[int]) -> tuple[list[int], list[int]]:
     for byte in range(255, -1, -1):
         representative[class_of[byte]] = byte
     return class_of, representative
+
+
+def _reachability_problems(expected: set[int], listed: Sequence[int], start: int) -> list[str]:
+    listed_set = {int(state) for state in listed}
+    problems = []
+    if start not in listed_set:
+        problems.append(f"the start state {start} is missing from the index's reachable states")
+    missing = sorted(expected - listed_set - {start})
+    if missing:
+        problems.append(
+            f"{len(missing)} token-reachable state(s) missing from the index's reachable "
+            f"states, e.g. {missing[:5]}"
+        )
+    extra = sorted(listed_set - expected)
+    if extra:
+        problems.append(
+            f"{len(extra)} state(s) listed as reachable that no token path reaches, "
+            f"e.g. {extra[:5]}"
+        )
+    return problems
 
 
 class DerivativeOracle:
@@ -233,7 +256,7 @@ class DerivativeOracle:
 
     def check_equivalence(self, dfa: DFA, *, max_mismatches: int = 5) -> EquivalenceReport:
         """Bisimulation walk over (DFA state, derivative) pairs from the start pair."""
-        report = EquivalenceReport()
+        report = EquivalenceReport(dfa=dfa)
         joint: dict[tuple[int, int], int] = {}
         for byte in range(256):
             joint.setdefault((int(dfa.byte_class[byte]), self.class_of[byte]), byte)
@@ -281,7 +304,17 @@ class DerivativeOracle:
         eos_id: int,
         max_mismatches: int = 5,
     ) -> TokenReport:
-        """Recompute allowed tokens and successors at every token-reachable DFA state."""
+        """Recompute allowed tokens and successors at every token-reachable DFA state.
+
+        The set of states reachable at token boundaries is computed here, not taken from the
+        index: a breadth-first search from the DFA start that follows only the tokens the oracle
+        allows (successors found by walking each token's bytes through the verified DFA table).
+        It must equal the index's ``reachable_states``, so an index that forgets a state (whose
+        mask would then never be checked) or lists an unreachable one is reported.
+        """
+        dfa = equivalence.dfa
+        if dfa is None:
+            raise ValueError("the equivalence report carries no DFA; use check_equivalence")
         trie = _TrieNode()
         for token_id, data in enumerate(token_bytes):
             if not data:
@@ -292,13 +325,25 @@ class DerivativeOracle:
             node.tokens.append(token_id)
         report = TokenReport()
         n_tokens = sum(1 for data in token_bytes if data)
-        for state in index.reachable_states:
+        start = int(dfa.start)
+        reached = {start}
+        queue: deque[int] = deque([start])
+        complete = True
+        while queue:
+            state = queue.popleft()
             regex = equivalence.representative.get(state)
             if regex is None:
                 report.mismatches.append(f"state {state} is not reachable in the oracle walk")
                 continue
             expected: dict[int, Regex] = {}
             self._collect(trie, regex, expected)
+            for token_id in expected:
+                successor = state
+                for byte in token_bytes[token_id]:
+                    successor = int(dfa.table[successor, dfa.byte_class[byte]])
+                if successor not in reached:
+                    reached.add(successor)
+                    queue.append(successor)
             actual = list(index.allowed_tokens(state))
             report.states_checked += 1
             report.tokens_checked += n_tokens
@@ -308,7 +353,10 @@ class DerivativeOracle:
             )
             report.mismatches.extend(problems)
             if len(report.mismatches) >= max_mismatches:
+                complete = False
                 break
+        if complete:
+            report.mismatches.extend(_reachability_problems(reached, index.reachable_states, start))
         return report
 
     def _collect(self, trie: _TrieNode, regex: Regex, out: dict[int, Regex]) -> None:

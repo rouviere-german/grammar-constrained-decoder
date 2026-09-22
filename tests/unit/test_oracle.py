@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -124,3 +125,44 @@ def test_oracle_state_cap() -> None:
     ab = alt(literal("a"), literal("b"))
     with pytest.raises(OracleLimitError):
         DerivativeOracle(cat(star(ab), literal("a"), rep(ab, 10, 10)), max_states=100)
+
+
+class _ReachabilityView:
+    """A token index whose reachable-state list was tampered with; everything else is real."""
+
+    def __init__(self, index: TokenIndex, reachable: list[int]) -> None:
+        self._index = index
+        self._reachable = reachable
+
+    @property
+    def reachable_states(self) -> list[int]:
+        return self._reachable
+
+    @property
+    def accepting(self) -> npt.NDArray[np.bool_]:
+        return self._index.accepting
+
+    def allowed_tokens(self, state: int) -> npt.NDArray[np.int32]:
+        return self._index.allowed_tokens(state)
+
+    def next_state(self, state: int, token: int) -> int:
+        return self._index.next_state(state, token)
+
+
+def test_oracle_computes_token_reachability_itself(small_vocab: ByteVocabulary) -> None:
+    regex = cat(literal('{"'), rep(alt(literal("ab"), literal("c")), 0, 3), literal('"}'))
+    dfa, index = _index(regex, small_vocab)
+    oracle = DerivativeOracle(regex)
+    equivalence = oracle.check_equivalence(dfa)
+    reachable = index.reachable_states
+    assert len(reachable) > 2
+    for dropped in reachable:  # the start state included
+        view = _ReachabilityView(index, [state for state in reachable if state != dropped])
+        report = oracle.check_token_index(view, small_vocab.token_bytes, equivalence, eos_id=0)
+        assert not report.ok, dropped
+        assert any("reachab" in problem for problem in report.mismatches), report.mismatches
+    extra = [state for state in range(dfa.n_states) if state not in reachable]
+    assert extra  # the dead state at least
+    padded = _ReachabilityView(index, sorted([*reachable, extra[0]]))
+    report = oracle.check_token_index(padded, small_vocab.token_bytes, equivalence, eos_id=0)
+    assert not report.ok
