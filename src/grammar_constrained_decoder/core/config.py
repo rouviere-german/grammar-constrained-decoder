@@ -33,6 +33,8 @@ class Settings(BaseSettings):
         env_prefix="APP_",
         env_file=".env",
         env_file_encoding="utf-8",
+        # ``KEY=`` (as in .env.example) means "not set": an empty secret must not fail validation.
+        env_ignore_empty=True,
         extra="ignore",
         frozen=True,
     )

@@ -36,6 +36,21 @@ def test_environment_variables_are_parsed(monkeypatch: pytest.MonkeyPatch) -> No
     assert settings.max_tokens_cap == 64
 
 
+def test_empty_environment_values_count_as_unset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # docker compose and a copied .env.example both produce ``KEY=`` for unset settings.
+    monkeypatch.setenv("APP_JWT_SECRET", "")
+    monkeypatch.setenv("APP_API_KEY_SHA256", "")
+    env_file = tmp_path / ".env"
+    env_file.write_text("APP_CORS_ALLOW_ORIGINS=\nAPP_MAX_TOKENS_CAP=\n", encoding="utf-8")
+    settings = Settings(_env_file=env_file)
+    assert settings.jwt_secret is None
+    assert settings.api_key_sha256 == []
+    assert settings.cors_allow_origins == []
+    assert settings.max_tokens_cap == 256
+
+
 def test_short_jwt_secrets_are_rejected() -> None:
     with pytest.raises(ValidationError, match="32 bytes"):
         Settings(_env_file=None, jwt_secret="short")

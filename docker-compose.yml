@@ -9,11 +9,13 @@ services:
     environment:
       APP_ENVIRONMENT: prod
       APP_LOG_LEVEL: INFO
-      # HS256 secret (32+ bytes) for the generation API; without it every token is refused.
-      APP_JWT_SECRET: ${APP_JWT_SECRET:-}
+      # Passed through from the shell or .env only when set (a key with no value). An empty value
+      # counts as unset. HS256 secret (32+ bytes) for the generation API; without it every token
+      # is refused.
+      APP_JWT_SECRET:
       # Comma-separated SHA-256 digests of operator keys for /metrics;
       # generate with `uv run grammar-constrained-decoder generate-api-key`.
-      APP_API_KEY_SHA256: ${APP_API_KEY_SHA256:-}
+      APP_API_KEY_SHA256:
       # Schema registry, audit log and index cache (the model itself is baked in read-only).
       APP_DATA_DIR: /data
     volumes:
