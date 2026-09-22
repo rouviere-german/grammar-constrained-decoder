@@ -25,8 +25,11 @@ WORKDIR /build
 COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
+# The registry writes files atomically via mkstemp, which creates them 0600. The runtime user is not
+# root, so the baked registry is made world-readable (still root-owned, so read-only for the app).
 RUN uv sync --frozen --no-dev --no-editable \
-    && /opt/venv/bin/python -m grammar_constrained_decoder train --workdir /opt/model --seed 0
+    && /opt/venv/bin/python -m grammar_constrained_decoder train --workdir /opt/model --seed 0 \
+    && chmod -R a+rX,go-w /opt/model
 
 FROM ${PYTHON_IMAGE} AS runtime
 LABEL org.opencontainers.image.title="grammar-constrained-decoder" \
