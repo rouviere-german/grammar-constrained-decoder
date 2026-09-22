@@ -10,7 +10,11 @@ from real runs, with the command that produced them.
   `uv run grammar-constrained-decoder train`.
 - **Type:** interpolated modified Kneser-Ney 5-gram language model over token ids (Kneser and Ney
   1995; Chen and Goodman 1998), implemented in numpy (`lm/kneser_ney.py`), with a byte-level BPE
-  tokenizer of 1,024 tokens trained with Hugging Face `tokenizers` (`lm/tokenizer.py`).
+  tokenizer of 1,024 tokens trained with Hugging Face `tokenizers` (`lm/tokenizer.py`). The three
+  discounts per order are Chen and Goodman's count-of-counts estimates, clamped to
+  `[0.1, k]`; the floor keeps every next-token distribution strictly positive on sparse data
+  (`tests/unit/test_lm.py::test_sparse_count_statistics_never_zero_a_probability`). The shipped
+  model's estimates are all between 0.54 and 2.46, so the floor does not change it.
 - **Owner:** Rouviere German. **License:** MIT (code and synthetic data).
 - **Artifacts:** `counts.npz` (npz, loaded with `allow_pickle=False`), `tokenizer.json` (the
   library's JSON), `model.json`; never pickle.
@@ -60,7 +64,11 @@ Downstream behavior (from `bench/bench_validity.py` and `bench/bench_distortion.
 Results): unconstrained sampling produced 0 valid documents out of 1,000 on held-out schemas and
 0 out of 360 on the training schemas, because after four tokens the model no longer knows which
 schema it is writing and mixes fields from different schemas. Masked decoding with the compiled
-grammar produced 1,000 valid documents out of 1,000.
+grammar produced 1,000 valid documents out of 1,000. For comparison, the bench also fits a 5-gram
+on 120 documents of each held-out schema alone (same tokenizer and code, not the shipped model):
+it is valid in 5.8% of unconstrained samples, 17.9% with three retries, and 100%
+constrained, because high-entropy values (random identifiers, numbers) still push a four-token
+context off the document structure.
 
 ## Robustness, drift and monitoring
 

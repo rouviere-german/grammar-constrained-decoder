@@ -9,7 +9,12 @@ each row.
 
 Output is **compact canonical JSON**: no insignificant whitespace, object members in schema
 declaration order, the canonical string escapes of `json.dumps(ensure_ascii=False)`, integers
-without leading zeros and numbers in fixed-point notation (no exponent, never `-0`).
+without leading zeros and numbers in fixed-point notation (no exponent, never `-0`). This holds
+for `enum`/`const` members too: `{"enum": [1e20, 1e-7, -0.0]}` compiles to
+`100000000000000000000`, `0.0000001` and `0.0`
+(`tests/unit/test_lower.py::test_numeric_enum_and_const_literals_use_fixed_point`). Object values
+inside an `enum` are emitted with their keys sorted (their canonical literal), not in declaration
+order.
 
 | Keyword | Status | Semantics in the compiled language | Evidence |
 |---|---|---|---|
@@ -40,8 +45,8 @@ without leading zeros and numbers in fixed-point notation (no exponent, never `-
 | `deprecated` | annotation | ignored | `tests/unit/test_schema_ir.py::test_annotations_are_ignored` |
 | `readOnly` | annotation | ignored | `tests/unit/test_schema_ir.py::test_annotations_are_ignored` |
 | `writeOnly` | annotation | ignored | `tests/unit/test_schema_ir.py::test_annotations_are_ignored` |
-| `$schema` | root-only | ignored at the root, rejected elsewhere | `tests/unit/test_schema_ir.py::test_root_only_keywords` |
-| `$id` | root-only | ignored at the root, rejected elsewhere | `tests/unit/test_schema_ir.py::test_root_only_keywords` |
+| `$schema` | root-only | ignored at the root (must be a string of at most 512 characters), rejected elsewhere | `tests/unit/test_schema_ir.py::test_root_only_keywords` |
+| `$id` | root-only | ignored at the root (must be a string of at most 512 characters), rejected elsewhere | `tests/unit/test_schema_ir.py::test_root_identifiers_must_be_strings` |
 | `$defs` | root-only | definitions for local `$ref` | `tests/unit/test_schema_ir.py::test_root_only_keywords` |
 | `definitions` | root-only | older spelling of `$defs` | `tests/unit/test_schema_ir.py::test_root_only_keywords` |
 | `oneOf` | rejected | exclusive disjunction needs language difference | `tests/unit/test_schema_ir.py::test_rejected_keywords_raise_explicit_errors` |
@@ -88,9 +93,19 @@ Any keyword not in this table is rejected as unknown.
 - Nesting depth (objects plus arrays) is capped at `max_depth` (default 6). Deeper non-recursive
   nesting is an error; recursive `$ref` alternatives beyond the cap are cut, so the compiled
   language contains exactly the instances whose nesting stays within the cap.
-- Limits (all configurable, all enforced during compilation): schema nodes, properties per object,
-  enum size, literal length, pattern length, repetition counts, number digits, NFA states, DFA
-  states, token-index entries and a wall-clock timeout. See `automata/limits.py`.
+- The schema document itself must be plain JSON: nesting at most `max_json_depth` (64) levels,
+  finite numbers only, and no string or object key containing a lone surrogate (it has no UTF-8
+  encoding). These are checked first, without recursion, and rejected with reason
+  `schema_depth` or `invalid`.
+- Reference chains: at most `max_ref_depth` (64) `$ref` expansions may be open at once while the
+  language is built, so a long chain of definitions is rejected (`ref_depth`) instead of
+  exhausting the Python stack. A reference cycle that passes through no container takes the
+  least fixed point (a cycle with nothing else is the empty language, rejected as
+  `empty_language`).
+- Limits (all configurable, all enforced during compilation): document depth, schema nodes,
+  properties per object, enum size, literal length, pattern length, repetition counts, number
+  digits, reference depth, NFA states, DFA states, NFA-state entries held by subset construction
+  (its memory), token-index entries and a wall-clock timeout. See `automata/limits.py`.
 
 ## Pattern subset
 
@@ -102,3 +117,23 @@ semantics: an unanchored side matches anywhere, as JSON Schema requires.
 Rejected: backreferences, lookaround, named groups, `\b \B`, `\p{...}`, `\cX`, octal escapes,
 anchors in other positions, lone `{ } ]`, quantifiers without an operand, patterns over 256
 characters and repetition counts over `max_repeat`.
+
+### Dialect: ECMA-262, not Python `re`
+
+JSON Schema specifies ECMA-262 regular expressions, and the compiler follows ECMA on the
+supported subset. Python's `re` (which the stock `jsonschema` validator uses for `pattern`)
+differs on a few points, so a document can be valid for one and invalid for the other:
+
+| construct | here (ECMA) | Python `re` on `str` |
+|---|---|---|
+| `\d`, `\w` | ASCII digits, ASCII word characters | any Unicode digit, any Unicode word character |
+| `\D`, `\W` | everything else, so they match `٣` (Arabic-Indic three) or `é` | exclude Unicode digits and letters |
+| `\s`, `\S` | the ECMA whitespace set (tab to CR, space, NBSP, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000, U+FEFF) | Python's Unicode whitespace set, which also includes U+001C to U+001F and U+0085 but not U+FEFF |
+| `.` | any code point except `\n`, `\r`, U+2028 and U+2029 | any character except `\n` |
+| `$` | end of the string only | end of the string or before a final `\n` |
+
+The service validates outputs with its `SafeValidator`, which matches `pattern` with these DFAs
+(ECMA semantics, never Python `re`), so it agrees with the compiled language. The bundled schemas
+use only ASCII classes and anchors, where the two dialects agree except for `$` before a final
+newline; `bench/bench_validity.py` checks every output with both validators and reports the
+disagreements (0 on constrained output is a threshold).
