@@ -6,7 +6,8 @@ classes -> Hopcroft minimization -> canonical form.
 - **Byte classes.** Bytes that every NFA edge treats alike are merged into one class, so the
   subset construction iterates over tens of classes instead of 256 bytes.
 - **Subset construction** (Rabin and Scott 1959) explores only reachable subsets and charges each
-  new DFA state to the budget, which bounds the classic exponential blow-up.
+  new DFA state to the budget, which bounds the classic exponential blow-up. The NFA-state
+  entries held by the closure and subset caches are charged too, which bounds its memory.
 - **Hopcroft minimization** (Hopcroft 1971) refines the accepting/non-accepting partition with the
   "process the smaller half" worklist, O(k n log n) for n states and k classes.
 - **Canonical form.** After minimization, classes with identical columns are merged and states
@@ -225,7 +226,7 @@ def determinize(nfa: NFA, budget: CompileBudget) -> DFA:
         cached = closures.get(state)
         if cached is None:
             cached = closures[state] = _closure(nfa, state)
-            budget.tick()
+            budget.charge_subsets(len(cached))
         return cached
 
     unions: dict[frozenset[int], frozenset[int]] = {}
@@ -235,6 +236,7 @@ def determinize(nfa: NFA, budget: CompileBudget) -> DFA:
         cached = unions.get(key)
         if cached is None:
             cached = unions[key] = frozenset().union(*(closure(t) for t in key))
+            budget.charge_subsets(len(key) + len(cached))
         return cached
 
     start_set = closure(nfa.start)

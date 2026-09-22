@@ -202,6 +202,19 @@ def test_cooperative_deadline_aborts_compilation() -> None:
     assert info.value.reason == "timeout"
 
 
+def test_subset_construction_memory_is_budgeted() -> None:
+    """Few DFA states, huge subsets: the state cap alone would let this allocate hundreds of MB
+    before the deadline. The subset-entry budget stops it with a typed reason."""
+    limits = CompileLimits(timeout_seconds=120, max_subset_entries=200_000)
+    budget = CompileBudget(limits)
+    started = time.perf_counter()
+    with pytest.raises(CompileLimitError) as info:
+        compile_regex(compile_pattern("^((a{0,90}){0,90}){0,90}$"), budget)
+    assert info.value.reason == "subset_size"
+    assert budget.dfa_states < limits.max_dfa_states
+    assert time.perf_counter() - started < 30
+
+
 def test_matching_is_linear_on_classic_redos_patterns() -> None:
     dfa = compile_regex(compile_pattern("^(a+)+$"))
     evil = b"a" * 30_000 + b"!"

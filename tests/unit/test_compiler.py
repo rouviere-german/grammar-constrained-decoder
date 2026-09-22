@@ -97,7 +97,10 @@ def test_limits_are_part_of_the_cache_key() -> None:
     ("schema", "reasons"),
     [
         ({"type": "string", "pattern": "^(a|b)*a(a|b){14}$"}, {"dfa_states"}),
-        ({"type": "string", "pattern": "^((a{0,50}){0,50}){0,50}$"}, {"nfa_states", "timeout"}),
+        (
+            {"type": "string", "pattern": "^((a{0,50}){0,50}){0,50}$"},
+            {"nfa_states", "subset_size", "timeout"},
+        ),
     ],
 )
 def test_state_explosions_are_rejected_within_the_timeout(
@@ -109,4 +112,22 @@ def test_state_explosions_are_rejected_within_the_timeout(
     with pytest.raises(CompileLimitError) as info:
         compiler.compile(schema)
     assert info.value.reason in reasons
-    assert time.perf_counter() - started < limits.timeout_seconds + 1.5
+    assert time.perf_counter() - started < limits.timeout_seconds + 0.5
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["^(a|b)*a(a|b){20}$", "^((a{0,90}){0,90}){0,90}$", "^(((a|b){0,60}){0,60}){0,60}$"],
+)
+def test_timeouts_fire_within_one_check_interval(pattern: str) -> None:
+    """With every other cap lifted, the deadline alone stops these; the cooperative checks run
+    at every new DFA state and every few dozen cheaper steps, so the overshoot stays small."""
+    limits = CompileLimits(
+        timeout_seconds=0.5, max_dfa_states=10**6, max_nfa_states=10**7, max_subset_entries=10**9
+    )
+    started = time.perf_counter()
+    with pytest.raises(CompileLimitError) as info:
+        GrammarCompiler(VOCAB, limits=limits).compile({"type": "string", "pattern": pattern})
+    elapsed = time.perf_counter() - started
+    assert info.value.reason == "timeout"
+    assert elapsed < limits.timeout_seconds + 0.25, elapsed
