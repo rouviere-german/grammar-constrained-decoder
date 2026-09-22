@@ -3,6 +3,9 @@ symbols, EOS handling, budget-aware masks and the dead-end check."""
 
 from __future__ import annotations
 
+import random
+import sys
+import threading
 from collections import deque
 
 import numpy as np
@@ -19,6 +22,7 @@ from grammar_constrained_decoder.automata.limits import (
     CompileLimits,
 )
 from grammar_constrained_decoder.automata.regex import Regex, alt, byteset, cat, literal, rep, star
+from grammar_constrained_decoder.decoding import index as index_module
 from grammar_constrained_decoder.decoding.index import DeadEndError, TokenIndex, build_token_index
 from grammar_constrained_decoder.lm.tokenizer import ByteVocabulary
 from grammar_constrained_decoder.schema.ir import parse_schema
@@ -177,3 +181,36 @@ def test_budget_mask_never_offers_a_token_that_cannot_finish(remaining: int) -> 
                 assert dfa.accepting[state]
             else:
                 assert int(index.distance[index.next_state(state, token)]) <= remaining - 1
+
+
+def test_mask_cache_is_safe_when_threads_share_an_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The compiler's memory cache hands one index to concurrent generations (API worker
+    threads). Lookups, LRU reordering and eviction of the mask cache must not race."""
+    vocab = make_vocab()
+    _, index = build(rep(literal("a"), 0, 6_000), vocab)  # 6,001 states > the 4,096-entry cache
+    states = index.reachable_states
+    assert len(states) > index_module._MASK_CACHE
+    monkeypatch.setattr(index_module, "_MASK_CACHE", 64)  # evict on almost every lookup
+    errors: list[str] = []
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # switch threads as often as possible to expose races
+
+    def worker(seed: int) -> None:
+        rng = random.Random(seed)
+        try:
+            for _ in range(8_000):
+                state = rng.choice(states)
+                mask = index.mask(state)
+                assert bool(mask[0]) == bool(index.accepting[state])
+        except Exception as exc:  # noqa: BLE001 - the test collects any failure
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=worker, args=(seed,)) for seed in range(8)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert errors == []

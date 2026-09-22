@@ -21,6 +21,7 @@ Two derived tables make decoding safe:
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict, deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -66,6 +67,9 @@ class TokenIndex:
     vocab_size: int
     _masks: OrderedDict[int, BoolArray] = field(default_factory=OrderedDict, repr=False)
     _max_next: IntArray | None = field(default=None, repr=False)
+    # One index is shared by concurrent generations (the compiler's memory cache hands the same
+    # object to every API worker thread), so the mask LRU is guarded.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def n_states(self) -> int:
@@ -92,15 +96,16 @@ class TokenIndex:
         return -1
 
     def _max_next_distance(self) -> IntArray:
-        if self._max_next is None:
+        cached = self._max_next
+        if cached is None:
             best = np.full(self.n_states, -1, dtype=np.int32)
             if self.n_entries:
                 owner = np.repeat(
                     np.arange(self.n_states, dtype=np.int32), np.diff(self.offsets).astype(np.int64)
                 )
                 np.maximum.at(best, owner, self.distance[self.targets])
-            self._max_next = best
-        return self._max_next
+            self._max_next = cached = best  # idempotent: racing threads compute the same array
+        return cached
 
     def mask(self, state: int, remaining: int | None = None) -> BoolArray:
         """Boolean mask over the vocabulary for ``state``.
@@ -116,17 +121,20 @@ class TokenIndex:
             limited[keep] = True
             limited[self.eos_id] = bool(self.accepting[state])
             return limited
-        cached = self._masks.get(state)
-        if cached is not None:
-            self._masks.move_to_end(state)
-            return cached
+        with self._lock:
+            cached = self._masks.get(state)
+            if cached is not None:
+                self._masks.move_to_end(state)
+                return cached
         full = np.zeros(self.vocab_size, dtype=np.bool_)
         full[self.allowed_tokens(state)] = True
         full[self.eos_id] = bool(self.accepting[state])
         full.flags.writeable = False
-        self._masks[state] = full
-        if len(self._masks) > _MASK_CACHE:
-            self._masks.popitem(last=False)
+        with self._lock:
+            self._masks[state] = full
+            self._masks.move_to_end(state)
+            while len(self._masks) > _MASK_CACHE:
+                self._masks.popitem(last=False)
         return full
 
     def check_no_dead_ends(self) -> None:
