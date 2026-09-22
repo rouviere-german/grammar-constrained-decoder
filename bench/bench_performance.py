@@ -37,6 +37,12 @@ def _deep(levels: int) -> dict[str, Any]:
     return schema
 
 
+def _ref_chain(links: int) -> dict[str, Any]:
+    definitions: dict[str, Any] = {f"d{i}": {"$ref": f"#/$defs/d{i + 1}"} for i in range(links)}
+    definitions[f"d{links}"] = {"type": "null"}
+    return {"$defs": definitions, "$ref": "#/$defs/d0"}
+
+
 STRESS: list[tuple[str, dict[str, Any]]] = [
     ("deep_nesting_200", _deep(200)),
     ("enum_10000", {"enum": [f"v{i}" for i in range(10_000)]}),
@@ -51,6 +57,8 @@ STRESS: list[tuple[str, dict[str, Any]]] = [
     ),
     ("any_of_5000", {"anyOf": [{"type": "null"}] * 5_000}),
     ("backreference", {"type": "string", "pattern": "(a+)\\1"}),
+    ("ref_chain_600", _ref_chain(600)),
+    ("lone_surrogate_enum", {"enum": ["ok", chr(0xD800)]}),
 ]
 
 

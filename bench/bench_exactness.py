@@ -5,13 +5,17 @@ Checks (fixed seeds via hypothesis ``derandomize``, CPU only):
 1. **Mask exactness** on ``--schemas`` (default 2,000) hypothesis-generated schemas in the subset,
    compiled against the trained 1,024-token vocabulary. For each schema the Brzozowski-derivative
    oracle walks the product of the compiled DFA and the derivative graph (a bisimulation, i.e. a
-   language-equivalence proof), then recomputes, at every DFA state reachable at a token boundary,
-   the set of tokens whose bytes leave the derivative non-empty, plus each token's successor, and
-   compares them with the precomputed token index. Mismatches must be 0.
+   language-equivalence proof), then finds the DFA states reachable at a token boundary itself
+   (a search over the tokens it allows), checks that set against the index's own list, and at
+   each of those states recomputes the set of tokens whose bytes leave the derivative non-empty,
+   plus each token's successor, and compares them with the precomputed token index. Mismatches
+   must be 0. A generated schema may only be rejected for an empty language; any other rejection
+   is counted in ``unexpected_rejections`` (threshold 0).
 2. **Completeness**: for each schema, up to 3 instances drawn by ``hypothesis-jsonschema`` (one
    derandomized run per schema); the canonical serialization of every instance must be accepted
    by the compiled DFA.
-3. **Dead ends**: every bundled and tiny schema compiles with the dead-end proof enabled.
+3. **Bundled and tiny schemas**: all 30 bundled and 20 tiny schemas (patterns, recursion, up to a
+   few thousand DFA states) compile with the dead-end proof and get the same oracle check as 1.
 4. **DFA vs re**: ``--patterns`` generated patterns in the ASCII-compatible subset, 40 random
    strings each, full-match and search semantics compared with Python ``re`` (``re.ASCII``) used
    as a trusted oracle on patterns this script generated itself.
@@ -95,6 +99,7 @@ def exactness(vocab: ByteVocabulary, n_schemas: int) -> dict[str, float]:
     stats: dict[str, float] = {
         "schemas": 0,
         "rejected_empty_language": 0,
+        "unexpected_rejections": 0,
         "dfa_states": 0,
         "token_reachable_states": 0,
         "token_decisions": 0,
@@ -111,9 +116,11 @@ def exactness(vocab: ByteVocabulary, n_schemas: int) -> dict[str, float]:
         try:
             compiled = compiler.compile(schema)
         except CompileError as exc:
-            if exc.reason != "empty_language":
+            if exc.reason == "empty_language":
+                stats["rejected_empty_language"] += 1
+            else:
+                stats["unexpected_rejections"] += 1
                 failures.append(f"unexpected rejection {exc.reason}: {schema}")
-            stats["rejected_empty_language"] += 1
             continue
         stats["schemas"] += 1
         stats["dfa_states"] += compiled.dfa.n_states
@@ -147,16 +154,43 @@ def exactness(vocab: ByteVocabulary, n_schemas: int) -> dict[str, float]:
     return stats
 
 
-def dead_ends(vocab: ByteVocabulary) -> dict[str, float]:
+def corpus_schemas(vocab: ByteVocabulary) -> dict[str, float]:
+    """Dead-end proof and the full oracle check on every bundled and tiny schema."""
     compiler = GrammarCompiler(vocab)
     schemas = [*load_bundled_schemas(), *load_distortion_schemas()]
-    failures = 0
+    stats = {
+        "dead_end_schemas_checked": float(len(schemas)),
+        "dead_end_failures": 0.0,
+        "corpus_oracle_schemas": 0.0,
+        "corpus_dfa_states": 0.0,
+        "corpus_token_reachable_states": 0.0,
+        "corpus_token_decisions": 0.0,
+        "corpus_equivalence_mismatches": 0.0,
+        "corpus_mask_mismatches": 0.0,
+    }
     for item in schemas:
         try:
-            compiler.compile(item.schema)
-        except CompileError:
-            failures += 1
-    return {"dead_end_schemas_checked": float(len(schemas)), "dead_end_failures": float(failures)}
+            compiled = compiler.compile(item.schema)
+        except CompileError as exc:
+            stats["dead_end_failures"] += 1
+            print(f"FAILURE: {item.id} rejected: {exc.reason}")
+            continue
+        oracle = DerivativeOracle(compiled.regex)
+        equivalence = oracle.check_equivalence(compiled.dfa)
+        tokens = oracle.check_token_index(
+            compiled.index, vocab.token_bytes, equivalence, eos_id=vocab.eos_id
+        )
+        stats["corpus_oracle_schemas"] += 1
+        stats["corpus_dfa_states"] += compiled.dfa.n_states
+        stats["corpus_token_reachable_states"] += tokens.states_checked
+        stats["corpus_token_decisions"] += tokens.tokens_checked
+        if not equivalence.ok:
+            stats["corpus_equivalence_mismatches"] += 1
+            print(f"FAILURE: {item.id} equivalence {equivalence.mismatches[:2]}")
+        if not tokens.ok:
+            stats["corpus_mask_mismatches"] += len(tokens.mismatches)
+            print(f"FAILURE: {item.id} mask {tokens.mismatches[:2]}")
+    return stats
 
 
 def pattern_agreement(n_patterns: int) -> dict[str, float]:
@@ -195,7 +229,9 @@ def main(argv: list[str] | None = None) -> int:
     mark = time.perf_counter()
     metrics = exactness(vocab, args.schemas)
     metrics["exactness_seconds"] = round(time.perf_counter() - mark, 1)
-    metrics.update(dead_ends(vocab))
+    mark = time.perf_counter()
+    metrics.update(corpus_schemas(vocab))
+    metrics["corpus_seconds"] = round(time.perf_counter() - mark, 1)
     metrics.update(pattern_agreement(args.patterns))
     metrics["mean_dfa_states"] = round(metrics["dfa_states"] / max(metrics["schemas"], 1), 1)
     metrics["total_seconds"] = round(time.perf_counter() - started, 1)

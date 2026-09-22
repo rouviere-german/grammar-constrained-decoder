@@ -37,6 +37,15 @@
     },
     "held_out_seconds": {
       "max": 300
+    },
+    "constrained_validator_disagreements": {
+      "max": 0
+    },
+    "single_schema_constrained_valid_ratio": {
+      "min": 1.0
+    },
+    "single_schema_generations": {
+      "min": 240
     }
   },
   "exactness": {
@@ -55,7 +64,19 @@
     "instances": {
       "min": 3000
     },
+    "unexpected_rejections": {
+      "max": 0
+    },
     "dead_end_failures": {
+      "max": 0
+    },
+    "corpus_oracle_schemas": {
+      "min": 50
+    },
+    "corpus_equivalence_mismatches": {
+      "max": 0
+    },
+    "corpus_mask_mismatches": {
       "max": 0
     },
     "re_disagreements": {
