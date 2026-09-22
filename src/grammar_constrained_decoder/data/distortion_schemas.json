@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "schemas": [
+    {"id": "bool", "split": "tiny", "description": "a boolean flag", "schema": {"type": "boolean"}},
+    {"id": "null", "split": "tiny", "description": "a null value", "schema": {"type": "null"}},
+    {"id": "color", "split": "tiny", "description": "a color name", "schema": {"enum": ["red", "green", "blue"]}},
+    {"id": "answer", "split": "tiny", "description": "a short answer", "schema": {"enum": ["yes", "no", "maybe"]}},
+    {"id": "digit", "split": "tiny", "description": "a single digit", "schema": {"type": "integer", "minimum": 0, "maximum": 9}},
+    {"id": "percent", "split": "tiny", "description": "a percentage", "schema": {"type": "integer", "minimum": 0, "maximum": 99}},
+    {"id": "offset", "split": "tiny", "description": "a small signed offset", "schema": {"type": "integer", "minimum": -5, "maximum": 5}},
+    {"id": "ab_word", "split": "tiny", "description": "a word over a and b", "schema": {"type": "string", "maxLength": 2, "pattern": "^[ab]*$"}},
+    {"id": "abc_code", "split": "tiny", "description": "a one or two letter code", "schema": {"type": "string", "pattern": "^[a-c]{1,2}$"}},
+    {"id": "ok_flag", "split": "tiny", "description": "a status object with an ok flag", "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": false}},
+    {"id": "small_id", "split": "tiny", "description": "an object with a small id", "schema": {"type": "object", "properties": {"id": {"type": "integer", "minimum": 1, "maximum": 5}}, "required": ["id"], "additionalProperties": false}},
+    {"id": "bool_pair", "split": "tiny", "description": "up to two boolean flags", "schema": {"type": "array", "items": {"type": "boolean"}, "maxItems": 2}},
+    {"id": "bits", "split": "tiny", "description": "one to three bits", "schema": {"type": "array", "items": {"enum": [0, 1]}, "minItems": 1, "maxItems": 3}},
+    {"id": "maybe_bool", "split": "tiny", "description": "a boolean or null", "schema": {"anyOf": [{"type": "boolean"}, {"type": "null"}]}},
+    {"id": "optional_pair", "split": "tiny", "description": "an object with optional flags", "schema": {"type": "object", "properties": {"a": {"type": "boolean"}, "b": {"type": "null"}}, "additionalProperties": false}},
+    {"id": "priority", "split": "tiny", "description": "a priority level", "schema": {"enum": ["low", "medium", "high"]}},
+    {"id": "digit_string", "split": "tiny", "description": "an empty or one digit string", "schema": {"type": "string", "maxLength": 1, "pattern": "^[0-9]*$"}},
+    {"id": "log_level", "split": "tiny", "description": "a log record with a level", "schema": {"type": "object", "properties": {"level": {"enum": ["info", "error"]}}, "required": ["level"], "additionalProperties": false}},
+    {"id": "small_ints", "split": "tiny", "description": "up to two small integers", "schema": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 3}, "maxItems": 2}},
+    {"id": "teen", "split": "tiny", "description": "a number between ten and twenty", "schema": {"type": "integer", "minimum": 10, "maximum": 20}}
+  ]
+}
