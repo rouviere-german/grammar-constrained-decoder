@@ -140,8 +140,10 @@ Compile a schema file and print its automaton statistics:
 
 Containers: `docker compose up --build` builds a non-root, read-only image that trains the model
 at build time and stores registry state in a named volume. Container build, smoke test (health and
-readiness), trivy scan and SBOM run in CI (`.github/workflows/ci.yml`, job `docker`); they were not
-run locally while building this repository.
+readiness), trivy scan and SBOM run in CI (`.github/workflows/ci.yml`, job `docker`). The build,
+non-root check (`uid=10001(app)`), HEALTHCHECK, `/readyz` and one authenticated `/v1/generate` call
+were also checked locally with Docker 29.6.1 (image: 87.8 MB content, 374 MB unpacked); trivy and
+the SBOM were not run locally.
 
 ## Results
 
