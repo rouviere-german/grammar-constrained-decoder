@@ -16,10 +16,16 @@ Subset (Draft 2020-12 vocabulary):
   omitting the keyword means closed too);
 - ``$defs``/``definitions`` at the root and local ``$ref`` (``#`` or ``#/$defs/name``). Recursive
   references are unrolled up to the nesting depth limit when the language is lowered.
+
+Before any keyword is looked at, :func:`check_json_document` walks the whole decoded value without
+recursion and rejects what the rest of the pipeline (canonical hashing, ``jsonschema``) cannot
+handle: values nested deeper than ``max_json_depth``, non-JSON types, non-finite numbers and
+strings or keys with lone surrogates (which have no UTF-8 encoding).
 """
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -53,7 +59,10 @@ __all__ = [
     "Ref",
     "SchemaIR",
     "String",
+    "check_json_document",
+    "fixed_point",
     "json_type_of",
+    "literal_text",
     "parse_schema",
 ]
 
@@ -119,6 +128,7 @@ REJECTED_KEYWORDS: Mapping[str, str] = {
 }
 _DEF_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _MAX_PROPERTY_NAME = 256
+_MAX_URI = 512
 ROOT_REF = "#"
 
 
@@ -217,6 +227,89 @@ def json_type_of(value: Any) -> str:  # noqa: PLR0911 - one return per JSON type
     raise SchemaError("", f"value of type {type(value).__name__} is not JSON", reason="invalid")
 
 
+def _has_lone_surrogate(text: str) -> bool:
+    return any(0xD800 <= ord(char) <= 0xDFFF for char in text)
+
+
+def _check_scalar(item: Any) -> None:
+    if isinstance(item, str):
+        if _has_lone_surrogate(item):
+            raise SchemaError(
+                "", "a string contains a lone surrogate (not valid Unicode)", reason="invalid"
+            )
+    elif isinstance(item, float):
+        if not math.isfinite(item):
+            raise SchemaError("", "numbers must be finite", reason="invalid")
+    elif item is not None and not isinstance(item, bool | int):
+        raise SchemaError("", f"value of type {type(item).__name__} is not JSON", reason="invalid")
+
+
+def check_json_document(value: Any, limits: CompileLimits = DEFAULT_LIMITS) -> None:
+    """Reject values that are not plain, finite, encodable JSON, iteratively (no recursion).
+
+    Raises :class:`SchemaError` (reason ``invalid``) for a non-JSON type, a non-finite number or a
+    string/key containing a lone surrogate, and :class:`CompileLimitError` (``schema_depth``)
+    for nesting deeper than ``limits.max_json_depth``. Messages never echo the offending value.
+    """
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if not isinstance(item, dict | list):
+            _check_scalar(item)
+            continue
+        if depth + 1 > limits.max_json_depth:
+            raise CompileLimitError(
+                "schema_depth",
+                f"the schema document nests deeper than {limits.max_json_depth} levels",
+            )
+        if isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+            continue
+        for key, child in item.items():
+            if not isinstance(key, str):
+                raise SchemaError(
+                    "", "keywords must be strings, as must every object key", reason="invalid"
+                )
+            if _has_lone_surrogate(key):
+                raise SchemaError(
+                    "", "an object key contains a lone surrogate (not valid Unicode)",
+                    reason="invalid",
+                )  # fmt: skip
+            stack.append((child, depth + 1))
+
+
+def fixed_point(value: float) -> str:
+    """Canonical text of a finite float: fixed-point notation, never an exponent, never ``-0``."""
+    if value == 0:
+        return "0.0"
+    return format(Decimal(repr(value)), "f")
+
+
+def literal_text(value: Any) -> str:
+    """Canonical text of an enum/const value: compact, object keys sorted, UTF-8 strings, integers
+    as digits and floats in fixed point (``1e20`` -> ``100000000000000000000``, ``-0.0`` ->
+    ``0.0``), so enum literals follow the same number rules as every other number we emit."""
+    if value is None or isinstance(value, bool):
+        return json.dumps(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise SchemaError("", "enum/const numbers must be finite", reason="invalid")
+        return fixed_point(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(literal_text(item) for item in value) + "]"
+    if isinstance(value, dict):
+        members = (
+            json.dumps(key, ensure_ascii=False) + ":" + literal_text(item)
+            for key, item in sorted(value.items())
+        )
+        return "{" + ",".join(members) + "}"
+    raise SchemaError("", "enum/const values must be JSON values", reason="invalid")
+
+
 def _safe_name(name: object) -> str:
     text = str(name)
     cleaned = "".join(char if char.isprintable() and char.isascii() else "?" for char in text)
@@ -226,14 +319,6 @@ def _safe_name(name: object) -> str:
 def _pointer(path: str, key: str | int) -> str:
     token = str(key).replace("~", "~0").replace("/", "~1")
     return f"{path}/{_safe_name(token)}"
-
-
-def _literal(value: Any) -> str:
-    """Canonical text of an enum/const value (compact, sorted keys, UTF-8, no NaN)."""
-    try:
-        return canonical_json(value)
-    except (TypeError, ValueError) as exc:
-        raise SchemaError("", "enum/const values must be JSON values", reason="invalid") from exc
 
 
 class _Parser:
@@ -253,6 +338,16 @@ class _Parser:
     def parse(self, schema: Any) -> SchemaIR:
         if not isinstance(schema, dict):
             raise SchemaError("", "the root schema must be a JSON object", reason="invalid")
+        check_json_document(schema, self.limits)
+        for keyword in ("$schema", "$id"):
+            if keyword in schema and (
+                not isinstance(schema[keyword], str) or len(schema[keyword]) > _MAX_URI
+            ):
+                raise SchemaError(
+                    f"/{keyword}",
+                    f"must be a string of at most {_MAX_URI} characters",
+                    reason="invalid",
+                )
         definitions_raw: dict[str, Any] = {}
         for keyword in ("$defs", "definitions"):
             if keyword in schema:
@@ -404,7 +499,7 @@ class _Parser:
             kind = json_type_of(value)
             if kind not in types and not (kind == "integer" and "number" in types):
                 continue
-            text = _literal(value)
+            text = literal_text(value)
             if len(text.encode("utf-8")) > self.limits.max_literal_bytes:
                 raise CompileLimitError(
                     "literal_size",

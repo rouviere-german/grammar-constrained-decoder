@@ -120,6 +120,18 @@ def test_enum_and_const_emit_canonical_literals() -> None:
     assert schema_dfa({"const": None}).accepts(b"null")
 
 
+def test_numeric_enum_and_const_literals_use_fixed_point() -> None:
+    """Enum/const numbers follow the same canonical number rules as every other number: fixed
+    point, never an exponent, never ``-0``, including numbers nested inside enum objects."""
+    dfa = schema_dfa({"enum": [1e20, 1e-7, -0.0, {"k": 2.5e-5}]})
+    for text in (b"100000000000000000000", b"0.0000001", b"0.0", b'{"k":0.000025}'):
+        assert dfa.accepts(text), text
+    for text in (b"1e+20", b"1e-07", b"-0.0", b'{"k":2.5e-05}'):
+        assert not dfa.accepts(text), text
+    assert schema_dfa({"const": 1e-7}).accepts(b"0.0000001")
+    assert not schema_dfa({"const": 1e-7}).accepts(b"1e-07")
+
+
 def test_any_of_is_a_union() -> None:
     dfa = schema_dfa(
         {"anyOf": [{"type": "integer", "maximum": 3}, {"type": "string", "maxLength": 1}]}

@@ -2,10 +2,11 @@
 
 Compilation takes attacker-controlled input (inline schemas on the API), and a regular language
 can have a DFA exponentially larger than its regex. Every stage therefore charges a
-:class:`CompileBudget`: NFA states, DFA states and a wall-clock deadline are checked inside the
-construction loops, so a hostile schema is rejected with a typed error instead of exhausting CPU
-or memory. The deadline is cooperative (checked in loops), so it needs no threads or signals and
-behaves the same on Windows and Linux.
+:class:`CompileBudget`: NFA states, DFA states, the NFA-state entries held by subset construction
+(its memory) and a wall-clock deadline are checked inside the construction loops, so a hostile
+schema is rejected with a typed error instead of exhausting CPU or memory. The deadline is
+cooperative (checked in loops), so it needs no threads or signals and behaves the same on Windows
+and Linux; a rejection can therefore land slightly after the deadline (one check interval).
 """
 
 from __future__ import annotations
@@ -59,7 +60,9 @@ class CompileLimits:
     """Caps applied while compiling one schema. Defaults suit the bundled schemas with headroom."""
 
     max_depth: int = 6
+    max_json_depth: int = 64
     max_schema_nodes: int = 2_000
+    max_ref_depth: int = 64
     max_properties: int = 64
     max_enum_values: int = 256
     max_literal_bytes: int = 4_096
@@ -68,6 +71,7 @@ class CompileLimits:
     max_number_digits: int = 24
     max_nfa_states: int = 200_000
     max_dfa_states: int = 20_000
+    max_subset_entries: int = 1_000_000
     max_index_entries: int = 8_000_000
     timeout_seconds: float = 10.0
 
@@ -97,6 +101,7 @@ class CompileBudget:
     deadline: float = field(default=0.0)
     nfa_states: int = 0
     dfa_states: int = 0
+    subset_entries: int = 0
     _ticks: int = 0
 
     def __post_init__(self) -> None:
@@ -135,4 +140,20 @@ class CompileBudget:
                 "dfa_states",
                 f"DFA exceeds {self.limits.max_dfa_states} states",
             )
-        self.tick(every=16)
+        self.check_time()
+
+    def charge_subsets(self, entries: int) -> None:
+        """Charge NFA-state entries held in subset-construction sets (the memory of determinize).
+
+        The DFA state cap bounds how many subsets exist, not how large each one is; a pattern
+        such as ``((a{0,90}){0,90}){0,90}`` creates few DFA states whose subsets hold thousands
+        of NFA states each. Charging the entries caps that memory (roughly 40 bytes per entry).
+        """
+        self.subset_entries += entries
+        if self.subset_entries > self.limits.max_subset_entries:
+            raise CompileLimitError(
+                "subset_size",
+                f"subset construction holds more than {self.limits.max_subset_entries} "
+                "NFA-state entries",
+            )
+        self.tick()

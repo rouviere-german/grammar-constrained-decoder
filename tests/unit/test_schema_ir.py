@@ -86,6 +86,16 @@ def test_root_only_keywords() -> None:
         parse_schema({"type": "array", "items": {"$defs": {}, "type": "null"}})
 
 
+def test_root_identifiers_must_be_strings() -> None:
+    """``jsonschema`` crashes on a non-string ``$id`` (it calls ``.rstrip`` on it), so the parser
+    rejects both identifiers unless they are short strings."""
+    for keyword, value in (("$id", 5), ("$schema", ["x"]), ("$id", "u" * 600)):
+        with pytest.raises(SchemaError) as info:
+            parse_schema({keyword: value, "type": "null"})
+        assert info.value.reason == "invalid"
+        assert info.value.path == f"/{keyword}"
+
+
 def test_type_lists_become_unions() -> None:
     ir = parse_schema({"type": ["string", "integer"], "maxLength": 2, "minimum": 1})
     assert ir.root == AnyOf((String(0, 2, None), Integer(1, None)))

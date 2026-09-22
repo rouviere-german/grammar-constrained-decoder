@@ -53,7 +53,7 @@ __all__ = [
     "GrammarCompiler",
 ]
 
-COMPILER_VERSION = "gcd-compiler/1"
+COMPILER_VERSION = "gcd-compiler/2"
 
 
 class CompileObserver(Protocol):

@@ -12,7 +12,9 @@ The language contains exactly the canonical serializations the decoder may emit:
 Bounded nesting is inlined: every object and array adds one level, and the language never needs a
 stack. A container deeper than ``max_depth`` is an error, except inside a recursive ``$ref``,
 where the recursion is cut (the deeper alternative becomes the empty language). A reference cycle
-that passes through no container is cut immediately, which yields the least fixed point.
+that passes through no container is cut immediately, which yields the least fixed point. Chains
+of references are bounded by ``max_ref_depth`` open expansions, so a long ``$ref`` chain is a typed
+``ref_depth`` rejection rather than a Python recursion error.
 Expansions are memoized per (definition, depth, recursion flag, open references), so identical
 subtrees (for example the two children of a binary tree) are shared in the regex DAG.
 """
@@ -121,6 +123,7 @@ class _Lowerer:
     limits: CompileLimits
     budget: CompileBudget
     memo: dict[tuple[object, ...], Regex] = field(default_factory=dict)
+    open_refs: int = 0  # $ref expansions on the current path (bounds the recursion depth)
 
     def node(self, node: Node, depth: int, stack: dict[str, int], recursive: bool) -> Regex:  # noqa: PLR0911
         self.budget.tick()
@@ -163,7 +166,16 @@ class _Lowerer:
         if cached is not None:
             return cached
         target = self.ir.root if name == ROOT_REF else self.ir.definitions[name]
-        result = self.node(target, depth, {**stack, name: depth}, recursive)
+        self.open_refs += 1
+        if self.open_refs > self.limits.max_ref_depth:
+            raise CompileLimitError(
+                "ref_depth",
+                f"$ref expansions nest deeper than the limit of {self.limits.max_ref_depth}",
+            )
+        try:
+            result = self.node(target, depth, {**stack, name: depth}, recursive)
+        finally:
+            self.open_refs -= 1
         self.memo[key] = result
         return result
 
