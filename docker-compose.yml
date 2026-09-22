@@ -1,0 +1,34 @@
+# Local stack. Only locally built images; nothing is pulled at runtime besides the pinned bases.
+services:
+  app:
+    build:
+      context: .
+    image: grammar-constrained-decoder:local
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_LOG_LEVEL: INFO
+      # HS256 secret (32+ bytes) for the generation API; without it every token is refused.
+      APP_JWT_SECRET: ${APP_JWT_SECRET:-}
+      # Comma-separated SHA-256 digests of operator keys for /metrics;
+      # generate with `uv run grammar-constrained-decoder generate-api-key`.
+      APP_API_KEY_SHA256: ${APP_API_KEY_SHA256:-}
+      # Schema registry, audit log and index cache (the model itself is baked in read-only).
+      APP_DATA_DIR: /data
+    volumes:
+      - gcd-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 2.0
+    restart: unless-stopped
+
+volumes:
+  gcd-data:
